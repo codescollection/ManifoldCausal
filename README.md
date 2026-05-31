@@ -78,13 +78,13 @@ plot_structural(align$gpa, fit_opt$gamma, Y, road_shape_array,
 
 
 
-Contributing
+## Contributing
 
 Contributions are welcome! Please submit bug reports, feature requests, or pull requests via the GitHub issue tracker.
 
 
 
-Citation
+## Citation
 
 If you use ManifoldCausal in your research, please cite the accompanying paper:
 
@@ -92,6 +92,6 @@ Shape Causal Inference with Manifold Endogeneity: A Nonparametric IV Approach. (
 
 
 
-License
+## License
 
 ManifoldCausal is released under the GNU General Public License v3.0.
