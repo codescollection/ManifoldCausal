@@ -1,0 +1,280 @@
+# ============================================================================
+# Empirical Analysis: Causal Effect of Road Network Shape on Economic Output
+# (Manifold Kernel Instrumental Variable – MKIV)
+# Uses 'shapes' package for Procrustes alignment and distance
+# ============================================================================
+
+# ---------- 0. Load packages ----------
+library(shapes)     # Procrustes analysis, shape distances
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(viridis)
+
+# ---------- 1. Load shape data for all cities ----------
+cities <- c("beijing", "chongqing", "hongkong", "macau")
+shape_files <- paste0(cities, "_road_shape.rds")
+
+# Read all shape objects and extract raw landmarks (in UTM meters)
+landmark_list <- lapply(shape_files, function(f) {
+  obj <- readRDS(f)
+  obj$landmarks_raw   # matrix of coordinates (n_points x 2)
+})
+
+# All cities must have the same number of landmarks for joint Procrustes alignment.
+# Re‑sample each to exactly 150 points.
+target_k <- 150
+landmark_aligned <- lapply(landmark_list, function(mat) {
+  if (nrow(mat) >= target_k) {
+    idx <- round(seq(1, nrow(mat), length.out = target_k))
+    mat[idx, ]
+  } else {
+    stop("Landmarks fewer than target_k – adjust target_k")
+  }
+})
+
+# Combine into a 3D array: (k x 2 x n) required by shapes::procGPA
+n_cities <- length(cities)
+shape_array <- array(dim = c(target_k, 2, n_cities))
+for (i in seq_len(n_cities)) {
+  shape_array[,,i] <- landmark_aligned[[i]]
+}
+
+# ---------- 2. Joint Procrustes alignment (using shapes) ----------
+# procGPA does full Procrustes alignment (scale, rotate, translate)
+gpa <- procGPA(shape_array, scale = TRUE, reflect = FALSE)
+# gpa$rotated   : aligned shapes (array k x 2 x n)
+# gpa$mshape    : mean shape (k x 2)
+# gpa$scores    : tangent space PC scores (n x (2k-4))
+
+# Manual computation of pairwise Procrustes distance matrix
+proc_dist <- matrix(0, n_cities, n_cities)
+for (i in 1:(n_cities - 1)) {
+  for (j in (i + 1):n_cities) {
+    d <- procdist(as.matrix(shape_array[,,i]), as.matrix(shape_array[,,j]), type = "full")
+    proc_dist[i, j] <- d
+    proc_dist[j, i] <- d
+  }
+}
+rownames(proc_dist) <- colnames(proc_dist) <- cities
+
+# ---------- 3. Define outcome Y and instrument Z ----------
+# **IMPORTANT**: Replace these placeholders with your real data!
+# Y = economic output (e.g., log GDP per capita, 2023)
+# Z = geographic obstacle (e.g., mean slope in degrees within urban area)
+
+Y <- c(12.38, 11.57, 12.92, 13.19)        # example: log GDP per capita (Beijing, Chongqing, HK, Macau)
+Z <- c(-1.1649217, -0.8797193, -0.0049334 , 2.0495744)          # example: mean slope (degrees)
+names(Y) <- names(Z) <- cities
+
+# If you have multiple instruments, uncomment and adjust:
+# Z_matrix <- cbind(slope = c(2.3,14.2,22.5,3.1),
+#                   ruggedness = c(0.12,0.89,1.42,0.10))
+
+# ---------- 4. Kernel IV estimation ----------
+
+# Gaussian kernel on distance matrices
+gauss_kernel <- function(D, sigma) {
+  exp(- (D^2) / (2 * sigma^2))
+}
+
+# Two‑stage kernel IV (MKIV)
+mkiv_fit <- function(Y, K_D, K_Z, lambda = 0.1, rho1 = 0.1) {
+  n <- length(Y)
+  # Stage 1: regress D-features on Z-features (ridge)
+  A <- chol2inv(chol(K_Z + rho1 * diag(n))) %*% K_D
+  K_D_hat <- K_Z %*% A
+  # Stage 2: regress Y on predicted D-features (ridge)
+  alpha <- chol2inv(chol(t(K_D_hat) %*% K_D_hat + lambda * diag(n))) %*% t(K_D_hat) %*% Y
+  list(fitted = K_D_hat %*% alpha, alpha = alpha)
+}
+
+# Build kernel matrices from distances
+sigma_D <- median(proc_dist[upper.tri(proc_dist)])  # median pairwise Procrustes distance
+K_D <- gauss_kernel(proc_dist, sigma_D)
+
+Z_dist <- as.matrix(dist(Z))                         # Euclidean distance of IV
+sigma_Z <- median(Z_dist[upper.tri(Z_dist)])
+K_Z <- gauss_kernel(Z_dist, sigma_Z)
+
+# Fit MKIV with a default lambda
+fit <- mkiv_fit(Y, K_D, K_Z, lambda = 0.1, rho1 = 0.1)
+cat("Fitted values (log GDP):", round(fit$fitted, 3), "\n")
+cat("True values (log GDP):", round(Y, 3), "\n")
+
+# ---------- 5. Cross‑validation for lambda ----------
+lambda_grid <- 10^seq(-3, 1, length.out = 20)
+cv_errors <- sapply(lambda_grid, function(lam) {
+  err <- 0
+  for (i in seq_len(n_cities)) {
+    # Leave‑one‑out
+    train_idx <- setdiff(1:n_cities, i)
+    K_D_train <- K_D[train_idx, train_idx]
+    K_Z_train <- K_Z[train_idx, train_idx]
+    Y_train <- Y[train_idx]
+    fit_loo <- tryCatch(
+      mkiv_fit(Y_train, K_D_train, K_Z_train, lambda = lam, rho1 = 0.1),
+      error = function(e) list(fitted = rep(NA, length(train_idx)))
+    )
+    if (any(is.na(fit_loo$fitted))) return(Inf)
+    # Predict for left‑out city: out‑of‑sample kernel vectors
+    k_D_test <- K_D[i, train_idx]
+    k_Z_test <- K_Z[i, train_idx]
+    # Predicted value: k_D_test %*% alpha (approximately)
+    pred <- k_D_test %*% fit_loo$alpha
+    err <- err + (Y[i] - pred)^2
+  }
+  sqrt(err / n_cities)
+})
+
+best_lambda <- lambda_grid[which.min(cv_errors)]
+cat("Optimal lambda (by CV):", best_lambda, "\n")
+
+# Refit with optimal lambda
+fit_opt <- mkiv_fit(Y, K_D, K_Z, lambda = best_lambda, rho1 = 0.1)
+
+# ---------- 6. Shape space visualization ----------
+# PCA of tangent space scores (from procGPA)
+pca_df <- as.data.frame(gpa$scores[,1:2])
+colnames(pca_df) <- c("PC1", "PC2")
+pca_df$city <- cities
+pca_df$Z <- Z
+
+# Plot
+ggplot(pca_df, aes(x = PC1, y = PC2, label = city, color = Z)) +
+  geom_point(size = 4) +
+  geom_text(vjust = -1, size = 5) +
+  scale_color_viridis(name = "Mean slope (°)") +
+  labs(title = "Road network shapes in PC space",
+       subtitle = "Procrustes tangent coordinates") +
+  theme_minimal(base_size = 14)
+
+# ---------- 7. First‑stage relevance (visual) ----------
+# Regress first PC of shape on Z
+first_stage <- lm(gpa$scores[,1] ~ Z)
+summary(first_stage)
+
+# Visual check
+ggplot(pca_df, aes(x = Z, y = PC1, label = city)) +
+  geom_point(size = 4) +
+  geom_smooth(method = "lm", se = FALSE, color = "#D55E00") +
+  geom_text(vjust = -1, size = 5) +
+  labs(x = "Mean slope (°)", y = "Shape PC1",
+       title = "First‑stage: Geographic obstacle vs. road network shape") +
+  theme_minimal(base_size = 14)
+
+# ---------- 8. Robustness: use different instruments ----------
+# Example: add ruggedness as second instrument
+# Z_alt <- cbind(slope = Z, ruggedness = c(0.12, 0.89, 1.42, 0.10))
+# Z_dist_alt <- as.matrix(dist(Z_alt))
+# sigma_Z_alt <- median(Z_dist_alt[upper.tri(Z_dist_alt)])
+# K_Z_alt <- gauss_kernel(Z_dist_alt, sigma_Z_alt)
+# fit_alt <- mkiv_fit(Y, K_D, K_Z_alt, lambda = best_lambda, rho1 = 0.1)
+
+# ---------- 9. Save results ----------
+saveRDS(list(
+  gpa = gpa,
+  proc_dist = proc_dist,
+  Y = Y,
+  Z = Z,
+  fit_opt = fit_opt,
+  best_lambda = best_lambda
+), file = "empirical_results.rds")
+
+cat("Analysis complete. Results saved to empirical_results.rds\n")
+
+
+
+# ============================================================================
+#  Plot the structural function g(d) along the first shape principal component
+# ============================================================================
+
+# ---------- 提取 Procrustes 结果 ----------
+mshape <- gpa$mshape            # k x 2 mean shape matrix
+pcar   <- gpa$pcar              # (2k) x (2k-4) principal component axes in tangent space
+# 注意：shapes::procGPA 的 pcar 是列主成分，每一列对应一个PC的方向向量（长度 2k）
+# scores 的每一列是主成分得分
+
+# ---------- 计算结构函数系数 gamma ----------
+n <- length(Y)
+rho1 <- 0.1  # 与 mkiv_fit 保持一致
+M <- K_Z %*% chol2inv(chol(K_Z + rho1 * diag(n)))   # 投影矩阵
+gamma <- M %*% fit_opt$alpha   # 结构函数系数 (n x 1)
+
+# ---------- 定义高斯核函数（与之前一致） ----------
+gauss_kernel_vec <- function(d_vec, sigma) {
+  exp(- (d_vec^2) / (2 * sigma^2))
+}
+
+# ---------- 生成沿 PC1 方向的虚拟形状 ----------
+k <- target_k
+s_range <- range(gpa$scores[,1])  # PC1 的实际范围
+s_seq <- seq(s_range[1] - 0.5, s_range[2] + 0.5, length.out = 100)  # 略微外延
+
+# 将平均形状和 PC1 载荷转换为向量形式
+mshape_vec <- as.vector(mshape)          # 长度 2k
+pc1_vec    <- pcar[, 1]                  # PC1 载荷向量 (2k)
+
+# 预分配存储
+g_pred <- numeric(length(s_seq))
+
+# 逐一生成虚拟形状并计算 g(d)
+for (idx in seq_along(s_seq)) {
+  s <- s_seq[idx]
+  # 生成新的形状向量（在切线空间中线性近似）
+  new_vec <- mshape_vec + s * pc1_vec
+  # 折叠为 k x 2 矩阵（注意：列顺序与 shapes 包一致，按列填充？需要验证）
+  # shapes::procGPA 中形状数组的存储是 (k x 2 x n)，向量化时通常是按列展开：
+  # as.vector(shape) 会变成 (x1, y1, x2, y2, ...) 吗？R 中矩阵按列展开，所以
+  # 如果 shape 是 k x 2，as.vector 会先遍历第一列（所有 x），再遍历第二列（所有 y），
+  # 即 c(x1, x2, ..., xk, y1, y2, ..., yk)。procrustes 分析中通常使用这种向量化。
+  # 因此我们在重建时也按列填充：先填 x 坐标，再填 y 坐标。
+  new_shape <- matrix(new_vec, nrow = k, ncol = 2, byrow = FALSE)
+  
+  # 计算新形状与所有训练形状的 Procrustes 距离（全普氏距离）
+  dists <- numeric(n)
+  for (i in 1:n) {
+    dists[i] <- procdist(new_shape, as.matrix(shape_array[,,i]), type = "full")
+  }
+  
+  # 计算核向量
+  k_new <- gauss_kernel_vec(dists, sigma_D)
+  
+  # 预测 g
+  g_pred[idx] <- sum(gamma * k_new)
+}
+
+# ---------- 绘制结构函数曲线 ----------
+plot_df <- data.frame(PC1 = s_seq, g = g_pred)
+# 实际城市的点
+city_points <- data.frame(PC1 = gpa$scores[,1], 
+                          g = fit_opt$fitted,  # 或者用 g(D_i) 的拟合值
+                          city = cities)
+
+# 计算纵坐标范围，上方留出足够空间
+y_min <- min(c(plot_df$g, city_points$Y, city_points$g)) - 0.3
+y_max <- max(c(plot_df$g, city_points$Y, city_points$g)) + 0.6
+
+ggplot(plot_df, aes(x = PC1, y = g)) +
+  # 结构函数曲线
+  geom_line(color = "#0072B2", size = 1.2) +
+  # 预测值（橙色圆点）
+  geom_point(data = city_points, aes(x = PC1, y = g),
+             color = "#D55E00", size = 3) +
+  geom_text(data = city_points, aes(label = city),
+            vjust = -1, color = "#D55E00", size = 4.5) +
+  # 真实值（深绿色三角）
+  geom_point(data = city_points, aes(x = PC1, y = Y),
+             color = "#228B22", size = 3, shape = 17) +
+  geom_text(data = city_points, aes(label = city, y = Y),
+            vjust = 2, color = "#228B22", size = 4.5) +
+  # 残差虚线
+  geom_segment(data = city_points,
+               aes(x = PC1, y = g, xend = PC1, yend = Y),
+               linetype = "dashed", color = "grey40", size = 0.8) +
+  labs(x = "Shape PC1 (road network morphology)",
+       y = "log GDP",
+       title = "Structural Function: Effect of Road Network Shape on Economic Output",
+       subtitle = "Orange points: predicted g(d); Green triangles: observed log GDP; Dashed lines: residuals") +
+  coord_cartesian(ylim = c(y_min, y_max)) +
+  theme_minimal(base_size = 14)

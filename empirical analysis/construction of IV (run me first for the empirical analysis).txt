@@ -1,0 +1,545 @@
+
+
+
+
+
+# ============================================================================
+# Build Composite Instrumental Variable (IV) from OSM data
+# Cities: Beijing, Chongqing, Hong Kong, Macau
+# ============================================================================
+
+library(sf)
+library(dplyr)
+library(tidyr)
+
+cities <- c("beijing", "chongqing", "hongkong", "macau")
+# Assume OSM data have been downloaded and unzipped into folders:
+#   beijing_shp, chongqing_shp, hongkong_shp, macau_shp
+
+# ---------- 1. Helper: compute area (m²) for polygons ----------
+area_m2 <- function(x) as.numeric(st_area(x))
+
+# ---------- 2. Define function to extract IV components for one city ----------
+extract_iv_components <- function(city_name) {
+  shp_dir <- paste0(city_name, "_shp")
+  
+  # ---- 2a. City boundary: use the union of all roads buffered (as before) ----
+  roads_file <- file.path(shp_dir, "gis_osm_roads_free_1.shp")
+  if (!file.exists(roads_file)) stop(paste("Road file not found for", city_name))
+  roads <- st_read(roads_file, quiet = TRUE) %>%
+    filter(fclass %in% c("primary", "secondary", "tertiary", "trunk"))
+  # Rough city area: convex hull of buffered main roads (consistent with earlier)
+  city_boundary <- roads %>%
+    st_geometry() %>%
+    st_union() %>%
+    st_buffer(1000) %>%    # 1 km buffer
+    st_convex_hull()
+  total_area <- area_m2(city_boundary)
+  
+  # ---- 2b. Water area ratio ----
+  water_file <- file.path(shp_dir, "gis_osm_water_a_free_1.shp")
+  if (file.exists(water_file)) {
+    water <- st_read(water_file, quiet = TRUE)
+    water_in_city <- st_intersection(water, city_boundary)
+    water_ratio <- if (nrow(water_in_city) > 0) sum(area_m2(water_in_city)) / total_area else 0
+  } else {
+    water_ratio <- 0
+  }
+  
+  # ---- 2c. Historic transport (railway & roads with historic/abandoned) ----
+  hist_rail_file <- file.path(shp_dir, "gis_osm_railways_free_1.shp")
+  hist_rail_length <- 0
+  if (file.exists(hist_rail_file)) {
+    rail <- st_read(hist_rail_file, quiet = TRUE)
+    # Look for historic/abandoned/disused tags in 'other_tags' column
+    if ("other_tags" %in% colnames(rail)) {
+      rail <- rail[grepl("historic|abandoned|disused|railway:historic", rail$other_tags), ]
+    }
+    if (nrow(rail) > 0) {
+      rail_city <- st_intersection(rail, city_boundary)
+      hist_rail_length <- sum(as.numeric(st_length(rail_city)))
+    }
+  }
+  
+  hist_road_file <- file.path(shp_dir, "gis_osm_roads_free_1.shp")
+  hist_road_length <- 0
+  if (file.exists(hist_road_file)) {
+    road_all <- st_read(hist_road_file, quiet = TRUE)
+    if ("other_tags" %in% colnames(road_all)) {
+      road_hist <- road_all[grepl("historic|abandoned|disused", road_all$other_tags), ]
+    } else road_hist <- road_all[0,]
+    if (nrow(road_hist) > 0) {
+      road_hist_city <- st_intersection(road_hist, city_boundary)
+      hist_road_length <- sum(as.numeric(st_length(road_hist_city)))
+    }
+  }
+  hist_transport_density <- (hist_rail_length + hist_road_length) / total_area
+  
+  # ---- 2d. Coastline presence (binary or length) ----
+  coastline_file <- file.path(shp_dir, "gis_osm_waterways_free_1.shp")
+  coastline_length <- 0
+  if (file.exists(coastline_file)) {
+    waterways <- st_read(coastline_file, quiet = TRUE)
+    # coastline is usually tagged as 'coastline' in waterway
+    if ("fclass" %in% colnames(waterways)) {
+      coast <- waterways %>% filter(fclass == "coastline")
+      if (nrow(coast) > 0) {
+        coast_city <- st_intersection(coast, city_boundary)
+        coastline_length <- sum(as.numeric(st_length(coast_city)))
+      }
+    }
+  }
+  
+  # ---- 2e. Elevation constraint: use contour lines if available ----
+  contour_file <- file.path(shp_dir, "gis_osm_contours_free_1.shp")
+  mean_slope_proxy <- NA
+  if (file.exists(contour_file)) {
+    contours <- st_read(contour_file, quiet = TRUE)
+    # Compute total length of contours inside city as a rough relief proxy
+    if (nrow(contours) > 0) {
+      contours_city <- st_intersection(contours, city_boundary)
+      # Normalise by area
+      mean_slope_proxy <- sum(as.numeric(st_length(contours_city))) / total_area
+    }
+  }
+  
+  # Return components
+  list(
+    city = city_name,
+    water_ratio = water_ratio,
+    hist_transport_density = hist_transport_density,
+    coastline_length_km = coastline_length / 1000,
+    contour_density = ifelse(is.na(mean_slope_proxy), 0, mean_slope_proxy)
+  )
+}
+
+# ---------- 3. Apply to all cities ----------
+iv_list <- lapply(cities, extract_iv_components)
+iv_df <- bind_rows(iv_list)
+print(iv_df)
+
+# ---------- 4. Build composite index (PCA) ----------
+# Select numerical columns for PCA
+iv_mat <- iv_df %>%
+  select(water_ratio, hist_transport_density, coastline_length_km, contour_density) %>%
+  as.matrix()
+
+# Standardise variables (mean 0, variance 1)
+iv_scaled <- scale(iv_mat)
+
+# Run PCA
+pca_iv <- prcomp(iv_scaled, center = FALSE, scale. = FALSE)
+summary(pca_iv)
+
+# Use the first principal component as the composite IV
+iv_composite <- pca_iv$x[, 1]
+
+# Print loadings
+print(pca_iv$rotation)
+
+# ---------- 5. Output the final IV vector ----------
+names(iv_composite) <- cities
+cat("\nComposite IV (PCA first PC) for each city:\n")
+print(iv_composite)
+
+# Optionally save
+saveRDS(list(components = iv_df, pca = pca_iv, iv_composite = iv_composite),
+        file = "composite_iv_osm.rds")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================================
+# Build Robust Composite IV from OSM PBF files (Final Enhanced Version v5)
+# New indicators added: wetland_ratio, military_ratio, brownfield_ratio,
+#                        landfill_ratio, historic_station_count, islet_count
+# ============================================================================
+
+library(sf)
+library(dplyr)
+library(osmdata)
+library(tidyr)
+
+# ---------- Enhanced extraction function v5 ----------
+extract_iv_components_v5 <- function(city_name, pbf_path, grid_size = 1000, buffer_dist = 1000) {
+
+  # ---- 1a. Main roads and city boundary ----
+  roads <- opq(pbf_path) %>%
+    add_osm_feature(key = "highway",
+                    value = c("primary", "secondary", "tertiary", "trunk")) %>%
+    osmdata_sf()
+  city_boundary <- roads$osm_lines %>%
+    st_geometry() %>%
+    st_union() %>%
+    st_buffer(buffer_dist) %>%
+    st_convex_hull()
+  total_area <- as.numeric(st_area(city_boundary))
+
+  # ---- 1b. Terrain obstacle index (grid-based) ----
+  natural_features <- opq(pbf_path) %>%
+    add_osm_feature(key = "natural",
+                    value = c("peak", "ridge", "cliff", "valley",
+                              "heath", "scrub", "bare_rock", "sand")) %>%
+    osmdata_sf()
+  grid <- st_make_grid(city_boundary, cellsize = grid_size, what = "polygons") %>%
+    st_intersection(city_boundary)
+  natural_poly <- natural_features$osm_polygons
+  natural_points <- natural_features$osm_points
+  obstacle_poly <- if (!is.null(natural_poly) && nrow(natural_poly) > 0) natural_poly$geometry else st_sfc()
+  obstacle_pts  <- if (!is.null(natural_points) && nrow(natural_points) > 0) {
+    st_buffer(natural_points$geometry, 200)
+  } else st_sfc()
+  obstacle_all <- c(obstacle_poly, obstacle_pts)
+  if (length(obstacle_all) > 0) {
+    obstacle_union <- st_union(obstacle_all)
+    grid_obstacle <- st_intersects(grid, obstacle_union, sparse = FALSE)
+    obstacle_cell_count <- sum(apply(grid_obstacle, 1, any))
+  } else {
+    obstacle_cell_count <- 0
+  }
+  terrain_obstacle_index <- obstacle_cell_count / length(grid)
+
+  # ---- 1c. Historic wall density ----
+  historic_walls <- opq(pbf_path) %>%
+    add_osm_feature(key = "historic",
+                    value = c("citywalls", "castle", "city_gate", "fortress")) %>%
+    osmdata_sf()
+  hist_wall_length <- 0
+  if (!is.null(historic_walls$osm_lines) && nrow(historic_walls$osm_lines) > 0) {
+    walls_city <- st_intersection(historic_walls$osm_lines, city_boundary)
+    hist_wall_length <- sum(as.numeric(st_length(walls_city)))
+  }
+  if (!is.null(historic_walls$osm_polygons) && nrow(historic_walls$osm_polygons) > 0) {
+    castle_city <- st_intersection(historic_walls$osm_polygons, city_boundary)
+    hist_wall_length <- hist_wall_length + sum(as.numeric(st_length(st_boundary(castle_city))))
+  }
+  historic_wall_density <- hist_wall_length / total_area
+
+  # ---- 1d. Water area ratio ----
+  water <- opq(pbf_path) %>%
+    add_osm_feature(key = "natural", value = c("water", "bay", "strait")) %>%
+    osmdata_sf()
+  if (!is.null(water$osm_polygons) && nrow(water$osm_polygons) > 0) {
+    water_city <- st_intersection(water$osm_polygons, city_boundary)
+    water_ratio <- sum(as.numeric(st_area(water_city))) / total_area
+  } else {
+    water_ratio <- 0
+  }
+
+  # ---- 1e. Historic transport density ----
+  hist_rail <- opq(pbf_path) %>%
+    add_osm_feature(key = "railway",
+                    value = c("abandoned", "disused", "razed", "dismantled")) %>%
+    osmdata_sf()
+  hist_rail_length <- 0
+  if (!is.null(hist_rail$osm_lines) && nrow(hist_rail$osm_lines) > 0) {
+    rail_city <- st_intersection(hist_rail$osm_lines, city_boundary)
+    hist_rail_length <- sum(as.numeric(st_length(rail_city)))
+  }
+  hist_roads <- opq(pbf_path) %>%
+    add_osm_feature(key = "highway", value = "historic") %>%
+    osmdata_sf()
+  hist_road_length <- 0
+  if (!is.null(hist_roads$osm_lines) && nrow(hist_roads$osm_lines) > 0) {
+    road_city <- st_intersection(hist_roads$osm_lines, city_boundary)
+    hist_road_length <- sum(as.numeric(st_length(road_city)))
+  }
+  hist_transport_density <- (hist_rail_length + hist_road_length) / total_area
+
+  # ---- 1f. Waterway density (rivers, canals) ----
+  waterways <- opq(pbf_path) %>%
+    add_osm_feature(key = "waterway",
+                    value = c("river", "stream", "canal", "drain", "ditch")) %>%
+    osmdata_sf()
+  waterway_length <- 0
+  if (!is.null(waterways$osm_lines) && nrow(waterways$osm_lines) > 0) {
+    waterways_city <- st_intersection(waterways$osm_lines, city_boundary)
+    waterway_length <- sum(as.numeric(st_length(waterways_city)))
+  }
+  waterway_density <- waterway_length / total_area
+
+  # ---- 1g. Natural cover ratio ----
+  natural_cover <- opq(pbf_path) %>%
+    add_osm_feature(key = "natural",
+                    value = c("wood", "scrub", "heath", "grassland", "bare_rock", "sand")) %>%
+    osmdata_sf()
+  natural_cover_area <- 0
+  if (!is.null(natural_cover$osm_polygons) && nrow(natural_cover$osm_polygons) > 0) {
+    cover_city <- st_intersection(natural_cover$osm_polygons, city_boundary)
+    natural_cover_area <- sum(as.numeric(st_area(cover_city)))
+  }
+  natural_cover_ratio <- natural_cover_area / total_area
+
+  # ---- 1h. River crossing density ----
+  river_lines <- opq(pbf_path) %>%
+    add_osm_feature(key = "waterway", value = c("river", "stream")) %>%
+    osmdata_sf()
+  road_lines <- roads$osm_lines
+  n_crossings <- 0
+  if (!is.null(river_lines$osm_lines) && nrow(river_lines$osm_lines) > 0 &&
+      !is.null(road_lines) && nrow(road_lines) > 0) {
+    crossings <- st_intersection(road_lines, river_lines$osm_lines)
+    n_crossings <- nrow(crossings)
+  }
+  river_crossing_density <- n_crossings / total_area * 1e6
+
+  # ---- 1i. Archaeological site density ----
+  archaeo <- opq(pbf_path) %>%
+    add_osm_feature(key = "historic",
+                    value = c("archaeological_site", "ruins", "tomb")) %>%
+    osmdata_sf()
+  archaeo_count <- 0
+  if (!is.null(archaeo$osm_points) && nrow(archaeo$osm_points) > 0) {
+    archaeo_city <- st_intersection(archaeo$osm_points, city_boundary)
+    archaeo_count <- nrow(archaeo_city)
+  }
+  if (!is.null(archaeo$osm_polygons) && nrow(archaeo$osm_polygons) > 0) {
+    archaeo_city <- st_intersection(archaeo$osm_polygons, city_boundary)
+    archaeo_count <- archaeo_count + nrow(archaeo_city)
+  }
+  archaeo_density <- archaeo_count / total_area * 1e6
+
+  # ---- 1j. Peak density ----
+  peaks <- opq(pbf_path) %>%
+    add_osm_feature(key = "natural", value = "peak") %>%
+    osmdata_sf()
+  peak_count <- 0
+  if (!is.null(peaks$osm_points) && nrow(peaks$osm_points) > 0) {
+    peaks_city <- st_intersection(peaks$osm_points, city_boundary)
+    peak_count <- nrow(peaks_city)
+  }
+  peak_density <- peak_count / total_area * 1e6
+
+  # ---- 1k. Landform complexity ----
+  landform_keys <- c("cliff", "ridge", "valley", "saddle", "rock", "stone",
+                     "cave_entrance", "sinkhole", "dune", "gorge")
+  landform_count <- 0
+  for (lk in landform_keys) {
+    feat <- opq(pbf_path) %>%
+      add_osm_feature(key = "natural", value = lk) %>%
+      osmdata_sf()
+    if (!is.null(feat$osm_points) && nrow(feat$osm_points) > 0) {
+      in_city <- st_intersection(feat$osm_points, city_boundary)
+      landform_count <- landform_count + nrow(in_city)
+    }
+    if (!is.null(feat$osm_lines) && nrow(feat$osm_lines) > 0) {
+      in_city <- st_intersection(feat$osm_lines, city_boundary)
+      landform_count <- landform_count + length(in_city)
+    }
+  }
+  landform_density <- landform_count / total_area * 1e6
+
+  # ---- 1l. Abandoned transport density ----
+  abandoned_rail <- opq(pbf_path) %>%
+    add_osm_feature(key = "railway", value = c("abandoned", "disused")) %>%
+    osmdata_sf()
+  ab_rail_length <- 0
+  if (!is.null(abandoned_rail$osm_lines) && nrow(abandoned_rail$osm_lines) > 0) {
+    ab_rail_city <- st_intersection(abandoned_rail$osm_lines, city_boundary)
+    ab_rail_length <- sum(as.numeric(st_length(ab_rail_city)))
+  }
+  abandoned_road <- opq(pbf_path) %>%
+    add_osm_feature(key = "highway", value = "abandoned") %>%
+    osmdata_sf()
+  ab_road_length <- 0
+  if (!is.null(abandoned_road$osm_lines) && nrow(abandoned_road$osm_lines) > 0) {
+    ab_road_city <- st_intersection(abandoned_road$osm_lines, city_boundary)
+    ab_road_length <- sum(as.numeric(st_length(ab_road_city)))
+  }
+  abandoned_transport_density <- (ab_rail_length + ab_road_length) / total_area
+
+  # ---- 1m. Protected area ratio ----
+  protected <- opq(pbf_path) %>%
+    add_osm_feature(key = "leisure", value = c("nature_reserve", "park")) %>%
+    osmdata_sf()
+  protected_area <- 0
+  if (!is.null(protected$osm_polygons) && nrow(protected$osm_polygons) > 0) {
+    prot_city <- st_intersection(protected$osm_polygons, city_boundary)
+    protected_area <- sum(as.numeric(st_area(prot_city)))
+  }
+  protected2 <- opq(pbf_path) %>%
+    add_osm_feature(key = "boundary", value = "protected_area") %>%
+    osmdata_sf()
+  if (!is.null(protected2$osm_polygons) && nrow(protected2$osm_polygons) > 0) {
+    prot2_city <- st_intersection(protected2$osm_polygons, city_boundary)
+    protected_area <- protected_area + sum(as.numeric(st_area(prot2_city)))
+  }
+  protected_area_ratio <- protected_area / total_area
+
+  # ---- 1n. Coastline binary ----
+  coastline <- opq(pbf_path) %>%
+    add_osm_feature(key = "natural", value = "coastline") %>%
+    osmdata_sf()
+  has_coastline <- 0
+  if (!is.null(coastline$osm_lines) && nrow(coastline$osm_lines) > 0) {
+    coast_city <- st_intersection(coastline$osm_lines, city_boundary)
+    has_coastline <- ifelse(nrow(coast_city) > 0, 1, 0)
+  }
+
+  # ---- 1o. Wetland area ratio (natural=wetland) ----
+  wetland <- opq(pbf_path) %>%
+    add_osm_feature(key = "natural", value = "wetland") %>%
+    osmdata_sf()
+  wetland_area <- 0
+  if (!is.null(wetland$osm_polygons) && nrow(wetland$osm_polygons) > 0) {
+    wet_city <- st_intersection(wetland$osm_polygons, city_boundary)
+    wetland_area <- sum(as.numeric(st_area(wet_city)))
+  }
+  wetland_ratio <- wetland_area / total_area
+
+  # ---- 1p. Military land ratio ----
+  military <- opq(pbf_path) %>%
+    add_osm_feature(key = "military") %>%
+    osmdata_sf()
+  military_area <- 0
+  if (!is.null(military$osm_polygons) && nrow(military$osm_polygons) > 0) {
+    mil_city <- st_intersection(military$osm_polygons, city_boundary)
+    military_area <- sum(as.numeric(st_area(mil_city)))
+  }
+  military_ratio <- military_area / total_area
+
+  # ---- 1q. Brownfield (industrial wasteland) ratio ----
+  brownfield <- opq(pbf_path) %>%
+    add_osm_feature(key = "landuse", value = "brownfield") %>%
+    osmdata_sf()
+  brown_area <- 0
+  if (!is.null(brownfield$osm_polygons) && nrow(brownfield$osm_polygons) > 0) {
+    brown_city <- st_intersection(brownfield$osm_polygons, city_boundary)
+    brown_area <- sum(as.numeric(st_area(brown_city)))
+  }
+  brownfield_ratio <- brown_area / total_area
+
+  # ---- 1r. Landfill ratio ----
+  landfill <- opq(pbf_path) %>%
+    add_osm_feature(key = "landuse", value = "landfill") %>%
+    osmdata_sf()
+  landfill_area <- 0
+  if (!is.null(landfill$osm_polygons) && nrow(landfill$osm_polygons) > 0) {
+    land_city <- st_intersection(landfill$osm_polygons, city_boundary)
+    landfill_area <- sum(as.numeric(st_area(land_city)))
+  }
+  landfill_ratio <- landfill_area / total_area
+
+  # ---- 1s. Historic railway stations ----
+  hist_stations <- opq(pbf_path) %>%
+    add_osm_feature(key = "railway", value = "station") %>%
+    osmdata_sf()
+  hist_station_count <- 0
+  if (!is.null(hist_stations$osm_points) && nrow(hist_stations$osm_points) > 0) {
+    # Only count stations with historic=yes or similar tags (check other_tags)
+    pts <- hist_stations$osm_points
+    if ("other_tags" %in% colnames(pts)) {
+      pts <- pts[grepl("historic", pts$other_tags), ]
+    }
+    if (nrow(pts) > 0) {
+      station_city <- st_intersection(pts, city_boundary)
+      hist_station_count <- nrow(station_city)
+    }
+  }
+  # Also check polygons if any
+  if (!is.null(hist_stations$osm_polygons) && nrow(hist_stations$osm_polygons) > 0) {
+    polys <- hist_stations$osm_polygons
+    if ("other_tags" %in% colnames(polys)) {
+      polys <- polys[grepl("historic", polys$other_tags), ]
+    }
+    if (nrow(polys) > 0) {
+      poly_city <- st_intersection(polys, city_boundary)
+      hist_station_count <- hist_station_count + nrow(poly_city)
+    }
+  }
+  hist_station_density <- hist_station_count / total_area * 1e6
+
+  # ---- 1t. Number of islands (place=island or islet) ----
+  islands <- opq(pbf_path) %>%
+    add_osm_feature(key = "place", value = c("island", "islet")) %>%
+    osmdata_sf()
+  islet_count <- 0
+  if (!is.null(islands$osm_points) && nrow(islands$osm_points) > 0) {
+    islet_city <- st_intersection(islands$osm_points, city_boundary)
+    islet_count <- nrow(islet_city)
+  }
+  if (!is.null(islands$osm_polygons) && nrow(islands$osm_polygons) > 0) {
+    islet_poly <- st_intersection(islands$osm_polygons, city_boundary)
+    islet_count <- islet_count + nrow(islet_poly)
+  }
+
+  # ---- Return all components ----
+  list(
+    city = city_name,
+    water_ratio = water_ratio,
+    terrain_obstacle_index = terrain_obstacle_index,
+    historic_wall_density = historic_wall_density,
+    hist_transport_density = hist_transport_density,
+    waterway_density = waterway_density,
+    natural_cover_ratio = natural_cover_ratio,
+    river_crossing_density = river_crossing_density,
+    archaeo_density = archaeo_density,
+    peak_density = peak_density,
+    landform_density = landform_density,
+    abandoned_transport_density = abandoned_transport_density,
+    protected_area_ratio = protected_area_ratio,
+    has_coastline = has_coastline,
+    wetland_ratio = wetland_ratio,
+    military_ratio = military_ratio,
+    brownfield_ratio = brownfield_ratio,
+    landfill_ratio = landfill_ratio,
+    hist_station_density = hist_station_density,
+    islet_count = islet_count
+  )
+}
+
+# ---------- Apply to all cities and build composite IV ----------
+cities <- c("beijing", "chongqing", "hongkong", "macau")
+pbf_paths <- list(
+  beijing   = "path/to/beijing-latest.osm.pbf",
+  chongqing = "path/to/chongqing-latest.osm.pbf",
+  hongkong  = "path/to/hong-kong-latest.osm.pbf",
+  macau     = "path/to/macau-latest.osm.pbf"
+)
+
+iv_list <- lapply(cities, function(city) {
+  cat("Processing", city, "...\n")
+  extract_iv_components_v5(city, pbf_paths[[city]])
+})
+iv_df <- bind_rows(iv_list)
+
+# Select numeric columns (exclude city)
+iv_mat <- iv_df %>%
+  select(-city) %>%
+  as.matrix()
+
+# Remove constant/zero variance columns
+col_vars <- apply(iv_mat, 2, var, na.rm = TRUE)
+iv_mat <- iv_mat[, col_vars > 1e-12, drop = FALSE]
+
+# Standardize and PCA
+iv_scaled <- scale(iv_mat)
+pca_iv <- prcomp(iv_scaled, center = FALSE, scale. = FALSE)
+summary(pca_iv)
+
+# Composite IV (first PC)
+iv_composite <- pca_iv$x[, 1]
+names(iv_composite) <- cities
+
+cat("\nFinal Composite IV (PCA PC1):\n")
+print(iv_composite)
+
+# First-stage regression
+Z <- iv_composite
+first_stage <- lm(gpa$scores[, 1] ~ Z)
+summary(first_stage)
+
+# Save
+saveRDS(list(components = iv_df, pca = pca_iv, iv_composite = iv_composite),
+        file = "composite_iv_osm_v5.rds")
