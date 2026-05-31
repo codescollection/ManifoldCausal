@@ -90,6 +90,8 @@ If you use ManifoldCausal in your research, please cite the accompanying paper:
 
 Shape Causal Inference with Manifold Endogeneity: A Nonparametric IV Approach. (submitted)
 
+please contact haoshiming@ynu.edu.cn if you have any questions concerning the use or methedologies of "ManifoldCausal".
+
 
 
 ## License
