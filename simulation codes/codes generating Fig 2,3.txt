@@ -1,0 +1,308 @@
+# ============================================================
+#  Optimized Simulation: Shape Causal Inference with Manifold IV
+#  Dependencies: shapes, ggplot2, dplyr, tidyr, purrr, MASS, viridis, ggpubr
+# ============================================================
+library(shapes)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(MASS)
+library(viridis)
+library(ggpubr)
+library(parallel)      # for parallel processing
+
+# ---------- Global ggplot theme ----------
+theme_paper <- function() {
+  theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      panel.grid.major = element_line(color = "grey90", size = 0.3),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(size = 14),
+      axis.text = element_text(size = 11),
+      legend.position = "bottom",
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+# ============================================================
+#  PART 1: 2D Kendall Shape with Endogenous Treatment
+# ============================================================
+
+# Fast Procrustes distance using procdist
+fast_proc_dist <- function(shapes) {
+  # shapes: array (k, 2, n)
+  # returns n x n full Procrustes distance matrix
+  as.matrix(procdist(shapes, type = "full"))
+}
+
+# Gaussian kernel on distance matrix
+gauss_kernel <- function(D, sigma) {
+  exp(- (D^2) / (2 * sigma^2))
+}
+
+# Two-stage kernel IV for manifold (MKIV) - optimized with chol2inv
+mkiv_fit <- function(Y, K_D, K_Z, lambda = 0.01, rho1 = 0.1) {
+  n <- length(Y)
+  # Stage 1: predict kernel features of D using Z
+  A <- chol2inv(chol(K_Z + rho1 * diag(n))) %*% K_D
+  K_D_hat <- K_Z %*% A
+  # Stage 2: regress Y on predicted features with ridge
+  alpha <- chol2inv(chol(t(K_D_hat) %*% K_D_hat + lambda * diag(n))) %*% t(K_D_hat) %*% Y
+  list(fitted = K_D_hat %*% alpha, alpha = alpha)
+}
+
+# Tangent IV using polynomial kernel
+tangent_iv_fit <- function(Y, X_tan, Z, lambda = 0.01, rho1 = 0.1) {
+  n <- length(Y)
+  # polynomial kernel degree 2
+  K_X <- (as.matrix(dist(X_tan))^2) %>% { exp(- . / median(.)) }
+  K_Z <- gauss_kernel(as.matrix(dist(Z)), median(dist(Z)))
+  A <- chol2inv(chol(K_Z + rho1 * diag(n))) %*% K_X
+  K_X_hat <- K_Z %*% A
+  alpha <- chol2inv(chol(t(K_X_hat) %*% K_X_hat + lambda * diag(n))) %*% t(K_X_hat) %*% Y
+  list(fitted = K_X_hat %*% alpha, alpha = alpha)
+}
+
+# Naive kernel ridge regression (ignores endogeneity)
+naive_fit <- function(Y, X_tan, lambda = 0.01) {
+  K_X <- gauss_kernel(as.matrix(dist(X_tan)), median(dist(X_tan)))
+  alpha <- chol2inv(chol(K_X + lambda * diag(n))) %*% Y
+  list(fitted = K_X %*% alpha, alpha = alpha)
+}
+
+# Single simulation replicate (optimized)
+run_sim_once <- function(n, k = 4, noise_sd = 0.05, conf_strength = 0.2,
+                         lambda = 0.01, rho1 = 0.1) {
+  # Generate data
+  Z <- runif(n, -1, 1)
+  U <- rnorm(n, 0, 0.5)
+  
+  # Mean shape: square
+  mshape <- matrix(c(-0.5,-0.5, 0.5,-0.5, 0.5,0.5, -0.5,0.5), 4, 2, byrow = TRUE)
+  conf_effect <- matrix(c(0.1,0.1, -0.1,0.1, -0.1,-0.1, 0.1,-0.1), 4, 2, byrow = TRUE)
+  
+  # Generate shapes with confounding
+  shapes <- array(0, dim = c(k, 2, n))
+  for (i in 1:n) {
+    shapes[,,i] <- mshape + matrix(rnorm(8, sd = noise_sd), 4, 2) +
+                   U[i] * conf_effect * conf_strength +
+                   Z[i] * matrix(c(0.1,0, 0,0.1, 0.1,0, 0,0.1), 4, 2, byrow = TRUE)
+  }
+  
+  # Procrustes alignment and tangent coordinates
+  gpa <- procGPA(shapes, scale = TRUE, reflect = FALSE)
+  X_tan <- gpa$scores[, 1:(2*k-4)]   # tangent coordinates
+  aligned_shapes <- gpa$rotated
+  
+  # True structural function (nonlinear)
+  g_vals <- sin(2 * X_tan[,1]) + cos(X_tan[,2])
+  
+  # Outcome with endogeneity
+  Y <- g_vals + 0.5 * U + rnorm(n, 0, 0.2)
+  
+  # Procrustes distance matrices
+  D_proc <- fast_proc_dist(shapes)   # using procdist for speed
+  sigma_D <- median(D_proc[upper.tri(D_proc)])
+  K_D <- gauss_kernel(D_proc, sigma_D)
+  
+  Z_dist <- as.matrix(dist(Z))
+  sigma_Z <- median(Z_dist[upper.tri(Z_dist)])
+  K_Z <- gauss_kernel(Z_dist, sigma_Z)
+  
+  # Fit models
+  fit_mkiv <- tryCatch(mkiv_fit(Y, K_D, K_Z, lambda, rho1),
+                       error = function(e) list(fitted = rep(NA, n)))
+  fit_tiv  <- tryCatch(tangent_iv_fit(Y, X_tan, Z, lambda, rho1),
+                       error = function(e) list(fitted = rep(NA, n)))
+  fit_naive <- tryCatch(naive_fit(Y, X_tan, lambda),
+                        error = function(e) list(fitted = rep(NA, n)))
+  
+  rmse_mkiv   <- sqrt(mean((g_vals - fit_mkiv$fitted)^2, na.rm = TRUE))
+  rmse_tiv    <- sqrt(mean((g_vals - fit_tiv$fitted)^2, na.rm = TRUE))
+  rmse_naive  <- sqrt(mean((g_vals - fit_naive$fitted)^2, na.rm = TRUE))
+  
+  data.frame(MKIV = rmse_mkiv, TangentIV = rmse_tiv, Naive = rmse_naive)
+}
+
+# Parallel simulation wrapper
+run_parallel_sim <- function(nvec, reps = 50, k = 4, noise_sd = 0.05,
+                             conf_strength = 0.2, lambda = 0.01, rho1 = 0.1) {
+  n_cores <- detectCores() - 1
+  cl <- makeCluster(n_cores)
+  # Export required objects and packages to workers
+  clusterExport(cl, varlist = c("run_sim_once", "fast_proc_dist", "gauss_kernel",
+                                "mkiv_fit", "tangent_iv_fit", "naive_fit",
+                                "procGPA", "procdist", "riemdist"),
+                envir = environment())
+  clusterEvalQ(cl, {
+    library(shapes)
+    library(MASS)
+  })
+  
+  results_list <- list()
+  for (n in nvec) {
+    # run replicates in parallel
+    reps_list <- parLapply(cl, 1:reps, function(i) {
+      run_sim_once(n, k, noise_sd, conf_strength, lambda, rho1)
+    })
+    df <- bind_rows(reps_list)
+    df$n <- n
+    results_list[[as.character(n)]] <- df
+    cat(sprintf("Finished n=%d\n", n))
+  }
+  
+  stopCluster(cl)
+  bind_rows(results_list)
+}
+
+# ---------- Execute simulation (adjust reps for speed) ----------
+set.seed(123)
+# For a quick demo, use small nvec and few reps
+nvec <- c(100, 200, 400)   # omit 800 to save time
+reps <- 30                  # reduce replicates for speed
+
+# Windows users: may need to use parLapply instead of mclapply.
+# The function run_parallel_sim above uses parLapply and is compatible.
+df_res <- run_parallel_sim(nvec, reps)
+
+# ---------- Visualization ----------
+df_long <- df_res %>%
+  pivot_longer(cols = c(MKIV, TangentIV, Naive),
+               names_to = "Method", values_to = "RMSE") %>%
+  mutate(Method = factor(Method, levels = c("MKIV", "TangentIV", "Naive")))
+
+# Boxplot
+p1 <- ggplot(df_long, aes(x = factor(n), y = RMSE, fill = Method)) +
+  geom_boxplot(outlier.size = 0.5, alpha = 0.85, color = "grey30") +
+  scale_fill_viridis_d(option = "D", end = 0.85) +
+  labs(title = "Convergence of Shape IV Estimators",
+       x = "Sample size n", y = "RMSE") +
+  theme_paper()
+
+# Median trend
+df_summary <- df_long %>%
+  group_by(n, Method) %>%
+  summarise(MedianRMSE = median(RMSE, na.rm = TRUE), .groups = "drop")
+
+p2 <- ggplot(df_summary, aes(x = n, y = MedianRMSE, color = Method, shape = Method)) +
+  geom_line(size = 1.2) + geom_point(size = 3) +
+  scale_color_viridis_d(option = "D", end = 0.85) +
+  scale_x_log10(breaks = nvec) +
+  labs(title = "Median RMSE vs. Sample Size",
+       x = "n (log scale)", y = "Median RMSE") +
+  theme_paper()
+
+p_part1 <- ggarrange(p1, p2, ncol = 2, common.legend = TRUE, legend = "bottom")
+print(p_part1)
+ggsave("sim1_rmse_plots.png", plot = p_part1, width = 12, height = 5, dpi = 300)
+
+# ============================================================
+#  PART 2: Shape Outcome and G-LATE (fast implementation)
+# ============================================================
+set.seed(456)
+n <- 400
+Z <- rbinom(n, 1, 0.5)
+U <- rnorm(n)
+latent <- 0.5 * Z + U
+T <- ifelse(latent > 0, 1, 0)  # monotonicity
+
+# Base shapes
+shape0_base <- matrix(c(0,0, 1,0, 0.5,1), 3, 2, byrow = TRUE)
+shape1_base <- matrix(c(0,0, 1.2,0, 0.6,1.2), 3, 2, byrow = TRUE)
+
+# Generate potential outcomes with confounding
+Y0 <- Y1 <- array(0, dim = c(3, 2, n))
+for (i in 1:n) {
+  Y0[,,i] <- shape0_base + matrix(rnorm(6, sd = 0.03), 3, 2) +
+    U[i] * matrix(rnorm(6, sd = 0.02), 3, 2)
+  Y1[,,i] <- shape1_base + matrix(rnorm(6, sd = 0.03), 3, 2) +
+    U[i] * matrix(rnorm(6, sd = 0.02), 3, 2)
+}
+Y_obs <- array(0, dim = c(3, 2, n))
+Y_obs[,, which(T==0)] <- Y0[,, which(T==0)]
+Y_obs[,, which(T==1)] <- Y1[,, which(T==1)]
+
+# True complier Fréchet means
+compliers <- which(T == 1 & Z == 1)  # in this DGP these are all compliers
+mu1_true <- procGPA(Y1[,,compliers], scale = TRUE, reflect = FALSE)$mshape
+mu0_true <- procGPA(Y0[,,compliers], scale = TRUE, reflect = FALSE)$mshape
+true_GLATE <- riemdist(mu1_true, mu0_true)
+
+# Weighted Frechet mean estimation using tangent space
+weighted_frechet <- function(shapes_subset, weights) {
+  # shapes_subset: array (k,2,m)
+  # weights: length m (some possibly negative, sum positive)
+  m <- dim(shapes_subset)[3]
+  if (m == 0) return(NULL)
+  # Align all to first shape using procOPA
+  aligned <- array(0, dim = dim(shapes_subset))
+  template <- shapes_subset[,,1]
+  for (i in 1:m) {
+    proc <- procOPA(template, shapes_subset[,,i], scale = TRUE, reflect = FALSE)
+    aligned[,,i] <- proc$Bhat
+  }
+  # Weighted average of aligned coordinates
+  w_norm <- weights / sum(weights)
+  wmean <- apply(aligned, c(1,2), function(x) sum(x * w_norm))
+  # Re-align to a common scale? Keep as is.
+  wmean
+}
+
+# Compute weights
+pZ1 <- mean(Z == 1)
+pZ0 <- mean(Z == 0)
+pT1_given_Z1 <- mean(T[Z == 1] == 1)
+pT1_given_Z0 <- mean(T[Z == 0] == 1)
+delta <- pT1_given_Z1 - pT1_given_Z0
+
+# Weights for Y(1) compliers: positive group Z=1,T=1; negative group Z=0,T=1
+group11 <- which(Z == 1 & T == 1)
+group01 <- which(Z == 0 & T == 1)
+n11 <- length(group11); n01 <- length(group01)
+w11 <- rep(pZ1 / delta, n11)
+w01 <- rep(-pZ0 / delta, n01)
+shapes_1 <- abind::abind(Y_obs[,,group11], Y_obs[,,group01], along = 3)
+mu1_est <- weighted_frechet(shapes_1, c(w11, w01))
+
+# Weights for Y(0) compliers: positive group Z=1,T=0; negative group Z=0,T=0
+pT0_given_Z1 <- 1 - pT1_given_Z1
+pT0_given_Z0 <- 1 - pT1_given_Z0
+delta0 <- pT0_given_Z1 - pT0_given_Z0
+group10 <- which(Z == 1 & T == 0)
+group00 <- which(Z == 0 & T == 0)
+n10 <- length(group10); n00 <- length(group00)
+w10 <- rep(pZ1 / delta0, n10)
+w00 <- rep(-pZ0 / delta0, n00)
+shapes_0 <- abind::abind(Y_obs[,,group10], Y_obs[,,group00], along = 3)
+mu0_est <- weighted_frechet(shapes_0, c(w10, w00))
+
+est_GLATE <- riemdist(mu1_est, mu0_est)
+cat(sprintf("True G-LATE: %.4f   Estimated G-LATE: %.4f\n", true_GLATE, est_GLATE))
+
+# Visualization of shapes
+shape_to_df <- function(mat, label) {
+  data.frame(x = mat[,1], y = mat[,2], label = label)
+}
+df_shapes <- rbind(
+  shape_to_df(mu1_true, "True Y(1)"),
+  shape_to_df(mu0_true, "True Y(0)"),
+  shape_to_df(mu1_est, "Est Y(1)"),
+  shape_to_df(mu0_est, "Est Y(0)")
+)
+df_shapes$type <- rep(c("True", "Estimated"), each = 6)
+
+p_glate <- ggplot(df_shapes, aes(x = x, y = y, color = label, linetype = type, shape = type)) +
+  geom_point(size = 4) + 
+  geom_path(aes(group = interaction(label, type)), size = 1.2) +
+  scale_color_manual(values = c("True Y(1)" = "#D55E00", "True Y(0)" = "#0072B2",
+                                "Est Y(1)" = "#F0E442", "Est Y(0)" = "#56B4E9")) +
+  labs(title = "G-LATE: Fréchet Means of Compliers",
+       subtitle = paste("True G-LATE =", round(true_GLATE, 4),
+                        " | Estimated =", round(est_GLATE, 4))) +
+  coord_fixed() + theme_paper()
+print(p_glate)
+ggsave("sim2_glate_shapes.png", plot = p_glate, width = 8, height = 6, dpi = 300)

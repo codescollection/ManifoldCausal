@@ -1,0 +1,117 @@
+# ============================================================================
+# Final Visualisation with Centered Legend (Unbolded Title)
+# ============================================================================
+library(ggplot2)
+
+set.seed(42)
+
+# ----- 1. 基本函数 -----
+centroid_size <- function(x) sqrt(sum(scale(x, scale = FALSE)^2))
+
+# ----- 2. 生成正八边形 -----
+theta <- seq(0, 2 * pi, length.out = 9)[1:8]
+S0 <- cbind(cos(theta), sin(theta))
+
+# ----- 3. 拉伸形状S1，作为变形方向 -----
+stretch <- 1.8
+S1 <- S0
+S1[, 1] <- S1[, 1] * stretch
+S1 <- S1 / centroid_size(S1) * centroid_size(S0)   # 保持质心大小不变
+
+pc_dir <- S1 - S0
+pc_dir <- pc_dir / centroid_size(pc_dir)            # 单位主方向
+
+# ----- 4. 沿测地线的均值形状 -----
+mu_z <- function(z) (1 - z) * S0 + z * S1
+
+# ----- 5. 生成所有形状数据 -----
+z_vals <- c(0.2, 0.4, 0.6, 0.8)
+delta <- 0.3   # 混杂强度
+sigma <- 0.1   # 形状噪声标准差
+
+all_shapes <- data.frame()
+
+for (z in z_vals) {
+  mean_shape <- mu_z(z)
+  k <- nrow(mean_shape)
+  idx_closed <- c(1:k, 1)
+
+  # 均值形状
+  df_mean <- data.frame(
+    x = mean_shape[idx_closed, 1],
+    y = mean_shape[idx_closed, 2],
+    group = "mean",
+    type = "mean",           # 用于图例分类
+    z = z
+  )
+  
+  # 扰动形状
+  for (i in 1:6) {
+    u <- rnorm(1, 0, 1)
+    noise <- matrix(rnorm(k * 2, 0, sigma), ncol = 2)
+    perturbation <- delta * u * pc_dir + noise
+    raw <- mean_shape + perturbation
+    raw <- raw / centroid_size(raw) * centroid_size(mean_shape)   # 缩放
+    df_pert <- data.frame(
+      x = raw[idx_closed, 1],
+      y = raw[idx_closed, 2],
+      group = paste0("pert_", i),
+      type = "perturbed",     # 用于图例分类
+      z = z
+    )
+    all_shapes <- rbind(all_shapes, df_pert)
+  }
+  all_shapes <- rbind(all_shapes, df_mean)
+}
+
+# 为每个面板创建标签
+all_shapes$z_label <- factor(paste0("Z = ", all_shapes$z),
+                             levels = paste0("Z = ", z_vals))
+
+# ----- 6. 绘图 -----
+p <- ggplot(all_shapes, aes(x = x, y = y, group = group,
+                            fill = type, colour = type,
+                            alpha = type, size = type)) +
+  geom_polygon() +
+  # 自定义颜色、透明度、线条粗细
+  scale_fill_manual(
+    values = c("mean" = "grey85", "perturbed" = "#0072B2"),
+    labels = c("mean" = "Mean shape", "perturbed" = "Perturbed shape")
+  ) +
+  scale_colour_manual(
+    values = c("mean" = "black", "perturbed" = "#0072B2"),
+    labels = c("mean" = "Mean shape", "perturbed" = "Perturbed shape")
+  ) +
+  scale_alpha_manual(
+    values = c("mean" = 1, "perturbed" = 0.15),
+    labels = c("mean" = "Mean shape", "perturbed" = "Perturbed shape")
+  ) +
+  scale_size_manual(
+    values = c("mean" = 0.8, "perturbed" = 0.4),
+    labels = c("mean" = "Mean shape", "perturbed" = "Perturbed shape")
+  ) +
+  facet_wrap(~ z_label, nrow = 1) +
+  coord_fixed() +
+  labs(
+    title = "Endogenous 2D Kendall Shape Treatment",
+    subtitle = "Mean shapes (grey) along the geodesic and perturbed shapes (blue) for different Z.\nPerturbations incorporate the unobserved confounder U."
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    # 图例设置在底部中间
+    legend.position = "bottom",
+    legend.justification = "center",
+    legend.direction = "horizontal",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),
+    # 标题修改为不加粗 (plain)
+    plot.title = element_text(size = 18, face = "plain"),
+    plot.subtitle = element_text(size = 12),
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.border = element_rect(colour = "grey70", fill = NA, size = 0.5)
+  )
+
+print(p)
