@@ -9,7 +9,7 @@ Dependencies: R (>= 3.5), shapes, ggplot2, dplyr, tidyr, viridis.
 ## Overview
 
 **ManifoldCausal** implements the manifold kernel instrumental variable (MKIV) estimator and the geodesic local average treatment effect (G‑LATE) proposed in *Shape Causal Inference with Manifold Endogeneity:
-A Nonparametric IV Approach*. It provides a unified R framework for causal inference when treatments and/or outcomes reside on non‑Euclidean shape manifolds (e.g., road networks, anatomical contours). The package avoids ad‑hoc Euclidean approximations by working directly with Procrustes shape distances and reproducing kernel Hilbert spaces on Riemannian manifolds.
+A Nonparametric IV Approach*. It provides an R framework for causal inference when treatments and/or outcomes reside on non‑Euclidean shape manifolds (e.g., road networks, anatomical contours). The package avoids ad‑hoc Euclidean approximations by working directly with Procrustes shape distances and reproducing kernel Hilbert spaces on Riemannian manifolds. *(under construction)*
 
 ## Key Features
 
