@@ -1,0 +1,36 @@
+Package: ManifoldCausal
+Type: Package
+Title: Causal Inference with Manifold-Valued Treatments and Outcomes
+Version: 1.0.0
+Authors@R: c(
+    person("Your Name", role = c("aut", "cre"), email = "your.email@ynu.edu.cn"),
+    person("Coauthor 1", role = "aut"),
+    person("Coauthor 2", role = "aut"))
+Description: Implements the manifold kernel instrumental variable (MKIV) estimator
+    and geodesic local average treatment effect (G-LATE) for shape-valued
+    treatments and outcomes. The methods are based on nonparametric IV techniques
+    extended to Riemannian manifolds, using Procrustes alignment, heat kernels,
+    and Fréchet means. Provides functions for shape alignment, distance matrix
+    calculation, MKIV estimation, cross-validation, structural function
+    visualization, and G-LATE identification. Includes example road network
+    shape data from four Chinese cities.
+License: GPL-3
+Encoding: UTF-8
+LazyData: true
+Depends:
+    R (>= 3.5.0),
+    shapes,
+    ggplot2
+Imports:
+    dplyr,
+    tidyr,
+    viridis,
+    stats,
+    utils
+Suggests:
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
+RoxygenNote: 7.2.3
+URL: https://github.com/codescollection/ManifoldCausal
+BugReports: https://github.com/codescollection/ManifoldCausal/issues
