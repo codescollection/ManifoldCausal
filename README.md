@@ -62,7 +62,7 @@ plot_structural(align$gpa, fit_opt$gamma, Y, road_shape_array,
                 sigma_D = sigma_D,
                 cities = c("Beijing","Chongqing","Hong Kong","Macau"))
 
-```r
+```
 
 
 
